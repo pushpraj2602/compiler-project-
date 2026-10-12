@@ -1,1 +1,186 @@
-
+struct Alloc { map<string, string> loc; map<string, pair<int, int>> iv; };
+static Alloc allocate(const Func& fn, int k) {
+    // Linear scan: live ranges are computed, loops extend them, and when more than k values are alive
+    Alloc A; auto& iv = A.iv; auto& loc = A.loc; const Code& code = fn.code;
+    auto touch = [&](const string& v, int i) {
+        auto it = iv.find(v);
+        if (it == iv.end()) iv[v] = {i, i}; else { it->second.first = min(it->second.first, i); it->second.second = max(it->second.second, i); }
+    };
+    for (auto& p : fn.params) touch(p, -1);
+    map<string, int> pos;
+    for (int i = 0; i < (int)code.size(); i++) {
+        for (auto& v : reads(code[i])) touch(v, i);
+        string d = dest(code[i]); if (!d.empty()) touch(d, i);
+        if (code[i].op == "label") pos[code[i].lab] = i;
+    }
+    for (int r = 0; r < 3; r++)   // a value alive at a loop head stays alive until the back-jump
+        for (int j = 0; j < (int)code.size(); j++)
+            if (isJump(code[j].op) && pos[code[j].lab] <= j)
+                for (auto& [v, se] : iv) if (se.first < pos[code[j].lab] && pos[code[j].lab] <= se.second && se.second < j) se.second = j;
+    VS order; for (auto& [v, se] : iv) order.push_back(v);
+    sort(order.begin(), order.end(), [&](const string& a, const string& b) { return make_pair(iv[a].first, a) < make_pair(iv[b].first, b); });
+    VS freeR, active; int slots = 0;
+    for (int i = 0; i < k; i++) freeR.push_back("R" + to_string(i));
+    for (const string& v : order) {
+        int start = iv[v].first, end = iv[v].second;
+        for (auto it = active.begin(); it != active.end();) { if (iv[*it].second < start) { freeR.push_back(loc[*it]); it = active.erase(it); } else ++it; }
+        sort(freeR.begin(), freeR.end(), [](const string& a, const string& b) { return stoi(a.substr(1)) < stoi(b.substr(1)); });
+        if (!freeR.empty()) { loc[v] = freeR.front(); freeR.erase(freeR.begin()); active.push_back(v); continue; }
+        string victim; for (auto& a : active) if (victim.empty() || iv[a].second > iv[victim].second) victim = a;
+        if (!victim.empty() && iv[victim].second > end) {
+            loc[v] = loc[victim]; loc[victim] = "M" + to_string(slots);
+            active.erase(find(active.begin(), active.end(), victim)); active.push_back(v);
+        } else loc[v] = "M" + to_string(slots);
+        slots++;
+    }
+    return A; }
+static Func toAsm(const Func& fn, const map<string, string>& loc) {
+    Func out{fn.name, {}, {}};
+    for (auto& p : fn.params) out.params.push_back(loc.at(p));
+    for (Ins i : fn.code) {
+        forEachRead(i, [&](O& o) { if (o.var()) o.s = loc.at(o.s); });
+        if (!dest(i).empty()) i.d = loc.at(i.d);
+        out.code.push_back(i);
+    }
+    return out; }
+static string os(const O& o) { return o.k ? to_string(o.v) : o.s; }
+static string showIR(const Ins& i) {
+    const string& op = i.op; string p = "    ";
+    if (op == "label") return i.lab + ":";
+    if (isBin(op)) return p + i.d + " = " + os(i.a) + " " + SYM.at(op) + " " + os(i.b);
+    if (op == "mov") return p + i.d + " = " + os(i.a);
+    if (op == "neg") return p + i.d + " = -" + os(i.a);
+    if (op == "not") return p + i.d + " = !" + os(i.a);
+    if (op == "aload") return p + i.d + " = " + os(i.a) + "[" + os(i.b) + "]";
+    if (op == "astore") return p + os(i.a) + "[" + os(i.b) + "] = " + os(i.c);
+    if (op == "newarr") return p + i.d + " = new int[" + os(i.a) + "]";
+    if (op == "jmp") return p + "goto " + i.lab;
+    if (op == "jz") return p + "if " + os(i.a) + " == 0 goto " + i.lab;
+    if (op == "jnz") return p + "if " + os(i.a) + " != 0 goto " + i.lab;
+    if (op == "print") return p + "print " + os(i.a);
+    if (op == "prints") return p + "print " + quote(i.text);
+    if (op == "read") return p + i.d + " = read";
+    if (op == "ret") return p + "ret" + (i.a.none() ? "" : " " + os(i.a));
+    VS args; for (auto& a : i.args) args.push_back(os(a));
+    return p + (i.d.empty() ? "" : i.d + " = ") + "call " + i.callee + "(" + join(args, ", ") + ")"; }
+static string showAsm(const Ins& i) {
+    if (i.op == "label") return i.lab + ":";
+    string up = i.op; for (char& c : up) c = toupper(c);
+    auto imm = [](const O& o) { return o.k ? "#" + to_string(o.v) : o.s; };
+    VS p;
+    if (i.op == "prints") p.push_back(quote(i.text));
+    else {
+        if (!i.d.empty()) p.push_back(i.d);
+        if (i.op == "call") p.push_back(i.callee);
+        for (const O* o : {&i.a, &i.b, &i.c}) if (!o->none()) p.push_back(imm(*o));
+        for (auto& x : i.args) p.push_back(imm(x));
+        if (!i.lab.empty()) p.push_back(i.lab);
+    }
+    string head = "    " + up; head.resize(11, ' ');
+    return head + join(p, ", "); }
+// ================================================================== reporting helpers
+static void tree(Node* n, int d) {   // each node on its own line, its parts indented below it
+    if (!n) return;
+    string s(d * 2, ' '); s += n->kind;
+    if (n->kind == "func") { VS ps; for (auto& p : n->params) ps.push_back(p.first + " " + p.second); s += " " + n->name + "(" + join(ps, ", ") + ") -> " + n->type; }
+    else {
+        if (!n->name.empty()) s += " " + n->name;
+        if (!n->op.empty()) s += " " + n->op;
+        if (n->kind == "num" || n->kind == "bool") s += " " + to_string(n->val);
+        if (n->kind == "str") s += " " + quote(n->text);
+        if (n->kind == "decl") s += " :" + n->type;
+    }
+    puts(s.c_str());
+    for (Node* c : {n->a, n->b, n->c, n->d}) tree(c, d + 1);
+    for (Node* c : n->list) tree(c, d + 1); }
+static void phase(const string& n, const string& title, const string& simple) {
+    string bar; for (int i = 0; i < 70; i++) bar += "═";
+    printf("\n%s\nPHASE %s · %s\n  %s\n", bar.c_str(), n.c_str(), title.c_str(), simple.c_str()); }
+static int total(const Prog& p) { int n = 0; for (auto& f : p) n += f.code.size(); return n; }
+int main(int argc, char** argv) {
+    const char* USAGE = "usage: minicpp program.cpp [--in 5 7 ...] [--regs N] [--sabotage]";
+    string path, mode; VS inputs; int regs = 6; bool sabotage = false;
+    for (int i = 1; i < argc; i++) {
+        string a = argv[i];
+        if (a == "--in") mode = "in";
+        else if (a == "--regs") mode = "regs";
+        else if (a == "--sabotage") { sabotage = true; mode = ""; }
+        else if (mode == "in") inputs.push_back(a);
+        else if (mode == "regs") { regs = max(0, atoi(a.c_str())); mode = ""; }
+        else if (path.empty()) path = a;
+    }
+    if (path.empty()) { puts(USAGE); return 1; }
+    ifstream fin(path);
+    if (!fin) { printf("✘ cannot open %s\n%s\n", path.c_str(), USAGE); return 1; }
+    stringstream ss; ss << fin.rdbuf(); string source = ss.str();
+    VS lines; { stringstream ls(source); string l; while (getline(ls, l)) lines.push_back(l); }
+    Node* program; unique_ptr<Sem> sem;
+    try {
+        vector<Token> tokens = tokenize(source);
+        phase("1", "LEXICAL ANALYSIS", "cuts the text into tokens (comments, #include, whitespace are dropped).");
+        map<string, int> cnt; printf("%-6s%-10s%s\n", "line", "kind", "lexeme");
+        for (size_t i = 0; i + 1 < tokens.size(); i++) {
+            const Token& t = tokens[i];
+            string cls = KEYWORDS.count(t.kind) ? "keyword" : t.kind == "id" ? "name" : t.kind == "num" ? "number" : t.kind == "str" ? "string" : "symbol";
+            cnt[cls]++;
+            if (i < 30) printf("%-6d%-10s%s\n", t.line, cls.c_str(), (t.kind == "str" ? quote(t.text) : t.text).c_str());
+        }
+        printf("... %d tokens: %d keywords, %d names, %d numbers, %d strings, %d symbols\n", (int)tokens.size() - 1,
+               cnt["keyword"], cnt["name"], cnt["number"], cnt["string"], cnt["symbol"]);
+        program = Parser(tokens).program();
+        phase("2", "SYNTAX ANALYSIS", "checks the grammar and builds a tree; indented lines are parts of the line above.");
+        for (Node* f : program->list) tree(f, 0);
+        printf("✔ grammar is correct (%d functions)\n", (int)program->list.size());
+        sem.reset(new Sem(program)); sem->run();
+        phase("3", "SEMANTIC ANALYSIS", "checks names are declared, types match, calls are right; builds the symbol table.");
+        for (Node* f : program->list) { VS ps; for (auto& p : f->params) ps.push_back(p.first + " " + p.second); printf("  %s %s(%s)\n", f->type.c_str(), f->name.c_str(), join(ps, ", ").c_str()); }
+        printf("%-12s%-9s%-12s%-6s%-7s%s\n", "name", "type", "unique id", "line", "role", "function");
+        for (Sym* s : sem->syms) printf("%-12s%-9s%-12s%-6d%-7s%s\n", s->name.c_str(), s->type.c_str(), s->uid.c_str(), s->line, s->role.c_str(), s->func.c_str());
+        for (auto& w : sem->warns) printf("⚠ warning: %s\n", w.c_str());
+        puts("✔ all names declared, all types match");
+    } catch (CompileError& e) {
+        puts("\n✘ COMPILE ERROR");
+        for (auto& m : e.errors) {
+            printf("  %s\n", m.c_str());
+            int ln = 0; if (sscanf(m.c_str(), "line %d", &ln) == 1 && ln > 0 && ln <= (int)lines.size()) printf("      | %s\n", lines[ln - 1].c_str());
+        }
+        return 1;
+    }
+    Prog ir = IRGen(sem->sigs).program(program);
+    phase("4", "INTERMEDIATE CODE", "one tiny action per line; %t1.. are scratch values, L1.. are jump targets.");
+    for (auto& f : ir) { printf("func %s(%s):\n", f.name.c_str(), join(f.params, ", ").c_str()); for (auto& i : f.code) puts(showIR(i).c_str()); }
+    printf("→ %d steps\n", total(ir));
+    VS log; int checked, ntrials;
+    Prog opt = optimize(ir, inputs, sabotage, log, checked, ntrials);
+    phase("5", "OPTIMIZATION", "fewer/faster steps; each change is re-tested on sample inputs and undone if the answer changes.");
+    for (auto& l : log) puts(l.c_str());
+    if (log.empty()) puts("nothing to improve in this program");
+    printf("(each change was checked on %d of %d test input sets)\n", checked, ntrials);
+    for (size_t f = 0; f < opt.size(); f++) {
+        printf("\nfunc %s(%s):  %d -> %d steps\n", opt[f].name.c_str(), join(opt[f].params, ", ").c_str(), (int)ir[f].code.size(), (int)opt[f].code.size());
+        for (auto& i : opt[f].code) puts(showIR(i).c_str());
+    }
+    Prog assembly; string text; int spills = 0;
+    phase("6", "CODE GENERATION", "maps variables to " + to_string(regs) + " registers R0.. (extras spill to slow memory M0..) and prints assembly.");
+    for (auto& f : opt) {
+        Alloc A = allocate(f, regs);
+        VS order; for (auto& [v, l] : A.loc) order.push_back(v);
+        sort(order.begin(), order.end(), [&](const string& a, const string& b) { return make_pair(A.iv[a].first, a) < make_pair(A.iv[b].first, b); });
+        VS desc; for (auto& v : order) { desc.push_back(v + "=" + A.loc[v]); spills += A.loc[v][0] == 'M'; }
+        printf("Registers in %s: %s\n", f.name.c_str(), join(desc, ", ").c_str());
+        assembly.push_back(toAsm(f, A.loc));
+        text += f.name + "(" + join(assembly.back().params, ", ") + "):\n";
+        for (auto& i : assembly.back().code) text += showAsm(i) + "\n";
+    }
+    fputs(text.c_str(), stdout);
+    string base = path.substr(0, path.rfind('.')); ofstream(base + ".asm") << text;
+    Result res = run(assembly, inputs, 5000000, true), orig = run(ir, inputs, 5000000);
+    phase("▶", "RUN AND VERIFY", "runs the machine code and compares with the un-optimized program.");
+    printf("Input given    : [%s]\nPROGRAM OUTPUT :\n", join(inputs, ", ").c_str());
+    string shown = res.out; while (!shown.empty() && shown.back() == '\n') shown.pop_back();
+    if (!shown.empty()) { stringstream o(shown); string l; while (getline(o, l)) printf("  %s\n", l.c_str()); }
+    if (res.status != "ok") printf("  [%s%s]\n", res.status.c_str(), res.msg.empty() ? "" : (": " + res.msg).c_str());
+    if (orig.status == "timeout") puts("Same as original program: not compared (the unoptimized program runs too long)");
+    else printf("Same as original program: %s\n", (res.out == orig.out && res.status == orig.status) ? "✔ yes" : "✘ NO - MISMATCH");
+    printf("Speed: %lld -> %lld cycles (%lld%% faster) · steps %d -> %d · registers: %d · spilled variables: %d\nAssembly saved to %s.asm\n",
+           orig.cost, res.cost, 100 * (orig.cost - res.cost) / max(orig.cost, 1LL), total(ir), total(opt), regs, spills, base.c_str()); }
