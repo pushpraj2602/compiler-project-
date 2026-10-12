@@ -1,1 +1,154 @@
 
+struct Node {   // one syntax-tree node; a/b/c/d/list are children whose meaning depends on kind
+    string kind, name, op, type, uid, text; int line = 0, val = 0; bool hasItems = false;
+    Node *a = nullptr, *b = nullptr, *c = nullptr, *d = nullptr;
+    vector<Node*> list; vector<pair<string, string>> params; VS puids; };
+static Node* mk(const string& k, int line) { Node* n = new Node; n->kind = k; n->line = line; return n; }
+static const map<string, int> PREC = {{"||", 1}, {"&&", 2}, {"==", 3}, {"!=", 3}, {"<", 4}, {">", 4}, {"<=", 4},
+                                      {">=", 4}, {"+", 5}, {"-", 5}, {"*", 6}, {"/", 6}, {"%", 6}};
+static const map<string, string> COMPOUND = {{"+=", "+"}, {"-=", "-"}, {"*=", "*"}, {"/=", "/"}, {"%=", "%"}};
+struct Parser {
+    vector<Token> T; size_t i = 0;
+    Parser(vector<Token> t) : T(move(t)) {}
+    const Token& tok() { return T[i]; }
+    const string& kind() { return T[i].kind; }
+    Token next() { Token t = T[i]; if (t.kind != "eof") i++; return t; }
+    bool accept(const string& k) { if (kind() == k) { next(); return true; } return false; }
+    [[noreturn]] void fail(const string& m, int line = 0) { throw CompileError{{"line " + to_string(line ? line : tok().line) + ": " + m}}; }
+    string found() { return kind() == "eof" ? string("end of file") : "'" + tok().text + "'"; }
+    Token expect(const string& k) {
+        if (kind() != k) fail("expected " + string(k == "id" ? "a name" : k == "num" ? "a number" : "'" + k + "'") + " but found " + found());
+        return next();
+    }
+    Node* program() { Node* p = mk("program", 1); while (kind() != "eof") p->list.push_back(function()); return p; }
+    string type_(bool voidOk = false) {
+        if (kind() == "int" || kind() == "bool" || (voidOk && kind() == "void")) return next().kind;
+        fail("expected a type but found " + found());
+    }
+    Node* function() {
+        Node* f = mk("func", tok().line); f->type = type_(true); f->name = expect("id").text; expect("(");
+        while (kind() != ")") {
+            string t = type_(), n = expect("id").text;
+            if (accept("[")) { expect("]"); t += "[]"; }
+            f->params.push_back({t, n});
+            if (!accept(",")) break;
+        }
+        expect(")"); f->a = block(); return f;
+    }
+    vector<Node*> declaration() {
+        int line = tok().line; string base = next().kind; vector<Node*> out;
+        do {
+            Node* d = mk("decl", line); d->name = expect("id").text; d->type = base;
+            if (accept("[")) {
+                d->type += "[]";
+                if (kind() != "]") d->a = expr();
+                expect("]");
+                if (accept("=")) { expect("{"); d->hasItems = true; while (kind() != "}") { d->list.push_back(expr()); if (!accept(",")) break; } expect("}"); }
+                if (!d->a && !d->hasItems) fail("array '" + d->name + "' needs a size or a list of values");
+            } else if (accept("=")) d->b = expr();
+            out.push_back(d);
+        } while (accept(","));
+        return out;
+    }
+    Node* block() {
+        Node* b = mk("block", expect("{").line);
+        while (kind() != "}" && kind() != "eof") for (Node* s : statement()) b->list.push_back(s);
+        expect("}"); return b;
+    }
+    Node* body() {
+        int line = tok().line; vector<Node*> s = statement();
+        if (s.size() == 1 && s[0]->kind == "block") return s[0];
+        Node* b = mk("block", line); b->list = s; return b;
+    }
+    Node* paren() { expect("("); Node* e = expr(); expect(")"); return e; }
+    vector<Node*> statement() {
+        string k = kind(); int line = tok().line;
+        if (k == "{") return {block()};
+        if (k == ";") { next(); return {}; }
+        if (k == "int" || k == "bool") { auto d = declaration(); expect(";"); return d; }
+        if (k == "cout") {
+            next(); Node* p = mk("print", line);
+            while (accept("<<")) {
+                if (accept("endl")) { Node* s = mk("str", line); s->text = "\n"; p->list.push_back(s); }
+                else if (kind() == "str") { Node* s = mk("str", line); s->text = next().text; p->list.push_back(s); }
+                else p->list.push_back(expr());
+            }
+            expect(";"); return {p};
+        }
+        if (k == "cin") {
+            next(); Node* r = mk("read", line);
+            while (accept(">>")) r->list.push_back(target());
+            expect(";"); return {r};
+        }
+        if (k == "if") {
+            next(); Node* n = mk("if", line); n->a = paren(); n->b = body();
+            if (accept("else")) n->c = body();
+            return {n};
+        }
+        if (k == "while") { next(); Node* n = mk("while", line); n->a = paren(); n->b = body(); return {n}; }
+        if (k == "for") return {forLoop()};
+        if (k == "return") {
+            next(); Node* n = mk("return", line); if (kind() != ";") n->a = expr();
+            expect(";"); return {n};
+        }
+        if (k == "break" || k == "continue") { next(); expect(";"); return {mk(k, line)}; }
+        if (k == "id" || k == "++" || k == "--") { Node* s = simple(); expect(";"); return {s}; }
+        fail("unexpected '" + tok().text + "'");
+    }
+    Node* forLoop() {
+        Node* f = mk("for", expect("for").line); expect("(");
+        if (kind() == "int" || kind() == "bool") {
+            auto d = declaration(); if (d.size() != 1) fail("declare only one variable in a for-loop header");
+            f->a = d[0];
+        } else if (kind() != ";") f->a = simple();
+        expect(";"); if (kind() != ";") f->b = expr();
+        expect(";"); if (kind() != ")") f->c = simple();
+        expect(")"); f->d = body(); return f;
+    }
+    Node* target() {
+        Token t = expect("id");
+        if (!accept("[")) { Node* v = mk("var", t.line); v->name = t.text; return v; }
+        Node* n = mk("index", t.line); n->name = t.text; n->a = expr(); expect("]"); return n;
+    }
+    Node* assign(int line, Node* target, const string& op, Node* value) {
+        Node* n = mk("assign", line); n->a = target; n->op = op; n->b = value; return n;
+    }
+    Node* one(int line) { Node* n = mk("num", line); n->val = 1; return n; }
+    Node* simple() {   // assignment, ++/--, or a call used as a statement (no ';')
+        int line = tok().line;
+        if (kind() == "++" || kind() == "--") { string op = next().kind.substr(0, 1); Node* t = target(); return assign(line, t, op, one(line)); }
+        if (T[i + 1].kind == "(") { Node* n = mk("exprstmt", line); n->a = expr(); return n; }
+        Node* t = target(); Token o = next();
+        if (o.kind == "++" || o.kind == "--") return assign(line, t, o.kind.substr(0, 1), one(line));
+        if (o.kind == "=") return assign(line, t, "=", expr());
+        if (COMPOUND.count(o.kind)) return assign(line, t, COMPOUND.at(o.kind), expr());
+        fail("expected '=' but found '" + o.text + "'", o.line);
+    }
+    Node* expr(int minPrec = 1) {   // precedence climbing
+        Node* left = unary();
+        while (PREC.count(kind()) && PREC.at(kind()) >= minPrec) {
+            Token op = next(); Node* n = mk("bin", op.line); n->op = op.kind; n->a = left; n->b = expr(PREC.at(op.kind) + 1); left = n;
+        }
+        return left;
+    }
+    Node* unary() {
+        if (kind() != "-" && kind() != "!") return primary();
+        Token t = next(); Node* n = mk("unary", t.line); n->op = t.kind; n->a = unary(); return n;
+    }
+    Node* primary() {
+        Token t = next();
+        if (t.kind == "num") { Node* n = mk("num", t.line); n->val = t.num; return n; }
+        if (t.kind == "true" || t.kind == "false") { Node* n = mk("bool", t.line); n->val = t.kind == "true"; return n; }
+        if (t.kind == "(") { Node* e = expr(); expect(")"); return e; }
+        if (t.kind == "id") {
+            if (accept("(")) {
+                Node* n = mk("call", t.line); n->name = t.text;
+                while (kind() != ")") { n->list.push_back(expr()); if (!accept(",")) break; }
+                expect(")"); return n;
+            }
+            if (accept("[")) { Node* n = mk("index", t.line); n->name = t.text; n->a = expr(); expect("]"); return n; }
+            Node* n = mk("var", t.line); n->name = t.text; return n;
+        }
+        fail("unexpected " + string(t.kind == "eof" ? "end of file" : "'" + t.text + "'") + " in an expression", t.line);
+    }
+};
