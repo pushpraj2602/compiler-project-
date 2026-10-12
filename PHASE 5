@@ -1,1 +1,158 @@
-
+static bool isC(const O& o, int v) { return o.k && o.v == v; }
+static int pFold(Code& code) {   // constant folding + algebra: 2*15 -> 30, x+0 -> x, x*0 -> 0, x-x -> 0
+    int n = 0;
+    for (Ins& ins : code) {
+        Ins nw = ins; const string& op = ins.op;
+        auto mov = [&](O v) { Ins m; m.op = "mov"; m.d = ins.d; m.a = v; nw = m; };
+        if (isBin(op)) {
+            O a = ins.a, b = ins.b; bool z = false;
+            if (a.k && b.k) { int r = calc(op, a.v, b.v, z); if (!z) mov(C(r)); }   // keep x/0: the crash must still happen
+            else if (((op == "add" || op == "sub") && isC(b, 0)) || ((op == "mul" || op == "div") && isC(b, 1))) mov(a);
+            else if ((op == "add" && isC(a, 0)) || (op == "mul" && isC(a, 1))) mov(b);
+            else if (op == "mul" && (isC(a, 0) || isC(b, 0))) mov(C(0));
+            else if (op == "sub" && a == b) mov(C(0));
+        } else if (op == "neg" && ins.a.k) mov(C(wrap(-(ll)ins.a.v)));
+        else if (op == "not" && ins.a.k) mov(C(ins.a.v == 0));
+        if (!(nw == ins)) n++;
+        ins = nw;
+    }
+    return n; }
+static int pStrength(Code& code) {   // x * 2^k becomes the cheaper x << k
+    int n = 0;
+    for (Ins& ins : code) {
+        if (ins.op != "mul") continue;
+        for (int swap = 0; swap < 2; swap++) {
+            O x = swap ? ins.b : ins.a, c = swap ? ins.a : ins.b;
+            if (c.k && !x.k && c.v >= 2 && (c.v & (c.v - 1)) == 0) {
+                ins.op = "shl"; ins.a = x; ins.b = C(__builtin_ctz(c.v)); n++; break;
+            }
+        }
+    }
+    return n; }
+static int pPropagate(Code& code) {   // copy and constant propagation inside each basic block
+    map<string, O> known; int n = 0;
+    for (Ins& ins : code) {
+        if (ins.op == "label") known.clear();
+        Ins old = ins;
+        forEachRead(ins, [&](O& o) { if (o.var()) { auto it = known.find(o.s); if (it != known.end()) o = it->second; } });
+        if (!(old == ins)) n++;
+        string d = dest(ins);
+        if (!d.empty()) {
+            known.erase(d);
+            for (auto it = known.begin(); it != known.end();) it = (it->second.var() && it->second.s == d) ? known.erase(it) : next(it);
+            if (ins.op == "mov" && !(ins.a.var() && ins.a.s == d)) known[d] = ins.a;
+        }
+    }
+    return n; }
+static bool fallsInto(const Code& code, size_t i, const string& lab) {
+    for (size_t j = i + 1; j < code.size() && code[j].op == "label"; j++) if (code[j].lab == lab) return true;
+    return false; }
+static int pJumps(Code& code) {   // constant conditions, jump threading, unreachable code, unused labels
+    Code start = code, c2;
+    for (const Ins& i : code) {
+        if (i.op == "jz" && i.a.k && i.a.v != 0) continue;       // never jumps
+        if (i.op == "jnz" && i.a.k && i.a.v == 0) continue;      // never jumps
+        Ins x = i;
+        if ((x.op == "jz" || x.op == "jnz") && x.a.k) { x.op = "jmp"; x.a = O(); }   // always jumps
+        c2.push_back(x);
+    }
+    code = c2;
+    map<string, string> alias;   // label immediately followed by "jmp X" is just another name for X
+    for (size_t k = 0; k < code.size(); k++) if (code[k].op == "label") {
+        size_t j = k + 1; while (j < code.size() && code[j].op == "label") j++;
+        if (j < code.size() && code[j].op == "jmp" && code[j].lab != code[k].lab) alias[code[k].lab] = code[j].lab;
+    }
+    auto fin = [&](string l) { set<string> seen; while (alias.count(l) && !seen.count(l)) { seen.insert(l); l = alias[l]; } return l; };
+    for (Ins& i : code) if (isJump(i.op)) i.lab = fin(i.lab);
+    for (;;) {
+        set<string> used; for (const Ins& i : code) if (isJump(i.op)) used.insert(i.lab);
+        Code nw; bool dead = false;
+        for (size_t k = 0; k < code.size(); k++) {
+            const Ins& i = code[k];
+            if (i.op == "label") { if (!used.count(i.lab)) continue; dead = false; }
+            else if (dead) continue;
+            if (i.op == "jmp" && fallsInto(code, k, i.lab)) continue;
+            nw.push_back(i); dead = i.op == "jmp" || i.op == "ret";
+        }
+        if (nw == code) break;
+        code = nw;
+    }
+    int d = abs((int)start.size() - (int)code.size());
+    return d ? d : (int)!(code == start); }
+static int pCoalesce(Code& code) {   // "%t = a + b ; x = %t" becomes "x = a + b" when %t is used only there
+    map<string, int> rn, dn;
+    for (const Ins& i : code) { for (auto& v : reads(i)) rn[v]++; string d = dest(i); if (!d.empty()) dn[d]++; }
+    Code out; int n = 0;
+    for (size_t i = 0; i < code.size();) {
+        string d = dest(code[i]);
+        if (!d.empty() && d[0] == '%' && i + 1 < code.size()) {
+            const Ins& nx = code[i + 1];
+            if (nx.op == "mov" && nx.a.var() && nx.a.s == d && rn[d] == 1 && dn[d] == 1) {
+                Ins m = code[i]; m.d = nx.d; out.push_back(m); i += 2; n++; continue;
+            }
+        }
+        out.push_back(code[i++]);
+    }
+    code = out; return n; }
+static int pDce(Code& code) {   // delete pure calculations whose result is never read
+    int n = 0;
+    for (;;) {
+        set<string> used; for (const Ins& i : code) for (auto& v : reads(i)) used.insert(v);
+        Code nw;
+        for (const Ins& i : code)
+            if (!(isPure(i.op) && (!used.count(i.d) || (i.op == "mov" && i.a.var() && i.a.s == i.d)))) nw.push_back(i);
+        if (nw.size() == code.size()) return n;
+        n += code.size() - nw.size(); code = nw;
+    }
+}
+static int pSabotage(Code& code) {   // deliberately WRONG: turns the first add into a sub (proves the safety check works)
+    for (Ins& i : code) if (i.op == "add") { i.op = "sub"; return 1; }
+    return 0; }
+struct Pass { const char* label; int (*fn)(Code&); };
+static const vector<Pass> PASSES = {
+    {"constant folding (2*15 -> 30, x+0 -> x)", pFold},
+    {"strength reduction (x*8 -> x<<3)", pStrength},
+    {"constant/copy propagation", pPropagate},
+    {"control-flow cleanup (dead branches, unused labels)", pJumps},
+    {"copy elimination (t=a+b; x=t -> x=a+b)", pCoalesce},
+    {"dead code elimination", pDce}};
+static const Pass SABOTAGE = {"deliberately WRONG change (sabotage test)", pSabotage};
+static Prog optimize(Prog cur, const VS& inputs, bool sabotage, VS& log, int& checked, int& ntrials) {
+    vector<VS> trials = {inputs}; mt19937 rng(7);
+    for (int t = 0; t < 8; t++) {
+        VS in; for (int k = 0; k < 8; k++) { int c = rng() % 7; in.push_back(to_string(c < 6 ? vector<int>{0, 1, 2, 3, 5, -1}[c] : (int)(rng() % 41) - 20)); }
+        trials.push_back(in);
+    }
+    vector<Result> base; for (auto& t : trials) base.push_back(run(cur, t, 30000));
+    checked = count_if(base.begin(), base.end(), [](const Result& r) { return r.status != "timeout"; }); ntrials = trials.size();
+    auto difference = [&](const Prog& cand, string& why) {
+        for (size_t t = 0; t < trials.size(); t++) {
+            if (base[t].status == "timeout") continue;
+            Result g = run(cand, trials[t], 30000);
+            if (g.out != base[t].out || g.status != base[t].status) {
+                size_t k = 0; while (k < min(g.out.size(), base[t].out.size()) && g.out[k] == base[t].out[k]) k++;
+                why = base[t].out == g.out ? "the error status differs" : "correct " + quote(base[t].out.substr(k, 8)) + ", it gave " + quote(g.out.substr(k, 8));
+                return true;
+            }
+        }
+        return false;
+    };
+    for (int round = 0; round < 8; round++) {
+        bool changed = false;
+        for (size_t f = 0; f < cur.size(); f++) {
+            vector<Pass> passes; if (sabotage && round == 0) passes.push_back(SABOTAGE);
+            passes.insert(passes.end(), PASSES.begin(), PASSES.end());
+            for (const Pass& p : passes) {
+                Code code = cur[f].code; int n = p.fn(code);
+                if (code == cur[f].code) continue;
+                Prog cand = cur; cand[f].code = code; string why;
+                if (difference(cand, why)) log.push_back("✘ UNDONE [" + cur[f].name + "] " + p.label + ": it changed the answer (" + why + ")");
+                else {
+                    log.push_back("✔ KEPT   [" + cur[f].name + "] " + p.label + ": " + to_string(cur[f].code.size()) + " -> " + to_string(code.size()) + " steps, " + to_string(n) + " change(s)");
+                    cur = cand; changed = true;
+                }
+            }
+        }
+        if (!changed) break;
+    }
+    return cur; }
