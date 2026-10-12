@@ -1,1 +1,211 @@
-
+struct O {   // operand: constant, variable name, or none
+    bool k = false; int v = 0; string s;
+    bool none() const { return !k && s.empty(); }
+    bool var() const { return !k && !s.empty(); }
+};
+static bool operator==(const O& x, const O& y) { return x.k == y.k && x.v == y.v && x.s == y.s; }
+static O C(int v) { O o; o.k = true; o.v = v; return o; }
+static O V(const string& s) { O o; o.s = s; return o; }
+// Ins layouts: BIN d=a op b | mov/neg/not/newarr d,a | aload d=a[b] | astore a[b]=c | jmp lab | jz/jnz a,lab | label lab
+struct Ins { string op, d, lab, text, callee; O a, b, c; vector<O> args; };
+static bool operator==(const Ins& x, const Ins& y) {
+    return x.op == y.op && x.d == y.d && x.lab == y.lab && x.text == y.text && x.callee == y.callee && x.a == y.a && x.b == y.b && x.c == y.c && x.args == y.args; }
+typedef vector<Ins> Code;
+struct Func { string name; VS params; Code code; };
+typedef vector<Func> Prog;
+static const map<string, string> BINOPS = {{"+", "add"}, {"-", "sub"}, {"*", "mul"}, {"/", "div"}, {"%", "mod"}, {"<", "lt"},
+                                           {">", "gt"}, {"<=", "le"}, {">=", "ge"}, {"==", "eq"}, {"!=", "ne"}};
+static const map<string, string> SYM = {{"add", "+"}, {"sub", "-"}, {"mul", "*"}, {"div", "/"}, {"mod", "%"}, {"lt", "<"}, {"gt", ">"},
+                                        {"le", "<="}, {"ge", ">="}, {"eq", "=="}, {"ne", "!="}, {"shl", "<<"}};
+static bool isBin(const string& o) { return SYM.count(o) > 0; }
+static bool isJump(const string& o) { return o == "jmp" || o == "jz" || o == "jnz"; }
+static bool isPure(const string& o) { return (isBin(o) && o != "div" && o != "mod") || o == "mov" || o == "neg" || o == "not"; }
+static string dest(const Ins& i) {
+    static const set<string> D = {"mov", "neg", "not", "aload", "newarr", "read", "call"};
+    return (isBin(i.op) || D.count(i.op)) ? i.d : ""; }
+template <class F> static void forEachRead(Ins& i, F f) {   // applies f to every value the instruction READS
+    const string& op = i.op;
+    if (isBin(op) || op == "aload") { f(i.a); f(i.b); }
+    else if (op == "mov" || op == "neg" || op == "not" || op == "newarr" || op == "jz" || op == "jnz" || op == "print" || op == "ret") f(i.a);
+    else if (op == "astore") { f(i.a); f(i.b); f(i.c); }
+    else if (op == "call") for (O& x : i.args) f(x); }
+static VS reads(Ins i) { VS r; forEachRead(i, [&](O& o) { if (o.var()) r.push_back(o.s); }); return r; }
+struct IRGen {
+    map<string, pair<VS, string>>& sigs; Code code; int nt = 0, nl = 0; vector<pair<string, string>> loops; string ret;
+    IRGen(map<string, pair<VS, string>>& s) : sigs(s) {}
+    Prog program(Node* p) {
+        Prog out;
+        for (Node* f : p->list) {
+            code.clear(); nt = nl = 0; loops.clear(); ret = f->type;
+            st(f->a);
+            Ins r; r.op = "ret"; if (f->type != "void") r.a = C(0); code.push_back(r);
+            out.push_back({f->name, f->puids, code});
+        }
+        return out;
+    }
+    void emit(const string& op, const string& d = "", O a = O(), O b = O(), O c = O(), const string& lab = "") {
+        Ins i; i.op = op; i.d = d; i.a = a; i.b = b; i.c = c; i.lab = lab; code.push_back(i);
+    }
+    string temp() { return "%t" + to_string(++nt); }
+    string label() { return "L" + to_string(++nl); }
+    O op(const string& name, O a = O(), O b = O()) { string t = temp(); emit(name, t, a, b); return V(t); }
+    O conv(O v, const string& got, const string& want) {   // int -> bool: any non-zero value becomes 1
+        if (want != "bool" || got != "int") return v;
+        if (v.k) return C(v.v != 0);
+        return op("ne", v, C(0));
+    }
+    O ex(Node* e) {
+        const string& k = e->kind;
+        if (k == "num" || k == "bool") return C(e->val);
+        if (k == "var") return V(e->uid);
+        if (k == "index") { O i = ex(e->a); return op("aload", V(e->uid), i); }
+        if (k == "unary") { O x = ex(e->a); return op(e->op == "-" ? "neg" : "not", x); }
+        if (k == "call") return call(e);
+        if (e->op == "&&" || e->op == "||") return logic(e);
+        O l = ex(e->a), r = ex(e->b); return op(BINOPS.at(e->op), l, r);
+    }
+    O logic(Node* e) {   // short-circuit: the right side only runs when the left side does not decide the answer
+        string j = e->op == "&&" ? "jz" : "jnz", res = temp(), shortL = label(), end = label();
+        O l = ex(e->a); emit(j, "", l, O(), O(), shortL);
+        O r = ex(e->b); emit(j, "", r, O(), O(), shortL);
+        emit("mov", res, C(e->op == "&&")); emit("jmp", "", O(), O(), O(), end);
+        emit("label", "", O(), O(), O(), shortL); emit("mov", res, C(e->op == "||")); emit("label", "", O(), O(), O(), end);
+        return V(res);
+    }
+    O call(Node* e) {
+        auto& sg = sigs[e->name]; Ins i; i.op = "call"; i.callee = e->name;
+        for (size_t n = 0; n < e->list.size(); n++) { O v = ex(e->list[n]); i.args.push_back(conv(v, e->list[n]->type, sg.first[n])); }
+        if (sg.second != "void") i.d = temp();
+        code.push_back(i); return i.d.empty() ? O() : V(i.d);
+    }
+    void jump(const string& op, O a, const string& l) { emit(op, "", a, O(), O(), l); }
+    void lab(const string& l) { emit("label", "", O(), O(), O(), l); }
+    void st(Node* s) {
+        const string& k = s->kind;
+        if (k == "block") for (Node* x : s->list) st(x);
+        else if (k == "decl") {
+            if (isArr(s->type)) {
+                O n = s->a ? ex(s->a) : C((int)s->list.size()); emit("newarr", s->uid, n);
+                for (size_t i = 0; i < s->list.size(); i++) { O v = ex(s->list[i]); emit("astore", "", V(s->uid), C((int)i), v); }
+            } else { O v = s->b ? conv(ex(s->b), s->b->type, s->type) : C(0); emit("mov", s->uid, v); }
+        } else if (k == "assign") {
+            Node* t = s->a;
+            if (t->kind == "var") {
+                O v = ex(s->b); string got = s->b->type;
+                if (s->op != "=") { v = op(BINOPS.at(s->op), V(t->uid), v); got = "int"; }
+                emit("mov", t->uid, conv(v, got, t->type));
+            } else {
+                O i = ex(t->a), v = ex(s->b);
+                if (s->op != "=") { O old = op("aload", V(t->uid), i); v = op(BINOPS.at(s->op), old, v); }
+                emit("astore", "", V(t->uid), i, v);
+            }
+        } else if (k == "exprstmt") ex(s->a);
+        else if (k == "print") {
+            for (Node* it : s->list) {
+                if (it->kind == "str") { Ins i; i.op = "prints"; i.text = it->text; code.push_back(i); }
+                else { O v = ex(it); emit("print", "", v); }
+            }
+        } else if (k == "read") {
+            for (Node* t : s->list) {
+                O r = op("read");
+                if (t->kind == "var") emit("mov", t->uid, conv(r, "int", t->type));
+                else { O i = ex(t->a); emit("astore", "", V(t->uid), i, r); }
+            }
+        } else if (k == "if") {
+            string skip = label(), end = label();
+            O c = ex(s->a); jump("jz", c, skip); st(s->b);
+            if (s->c) { jump("jmp", O(), end); lab(skip); st(s->c); lab(end); } else lab(skip);
+        } else if (k == "while") {
+            string top = label(), end = label();
+            lab(top); O c = ex(s->a); jump("jz", c, end);
+            loops.push_back({top, end}); st(s->b); loops.pop_back();
+            jump("jmp", O(), top); lab(end);
+        } else if (k == "for") {
+            if (s->a) st(s->a);
+            string top = label(), step = label(), end = label();
+            lab(top);
+            if (s->b) { O c = ex(s->b); jump("jz", c, end); }
+            loops.push_back({step, end}); st(s->d); loops.pop_back();
+            lab(step); if (s->c) st(s->c);
+            jump("jmp", O(), top); lab(end);
+        } else if (k == "break") jump("jmp", O(), loops.back().second);
+        else if (k == "continue") jump("jmp", O(), loops.back().first);
+        else if (k == "return") emit("ret", "", s->a ? conv(ex(s->a), s->a->type, ret) : O());
+    }
+};
+// ============================================ the virtual machine (runs IR and assembly)
+struct Result { string out, status = "ok", msg; ll cost = 0; };
+static int calc(const string& op, int a, int b, bool& trap) {   // single definition of arithmetic (VM + optimizer)
+    if (op == "lt") return a < b;
+    if (op == "gt") return a > b;
+    if (op == "le") return a <= b;
+    if (op == "ge") return a >= b;
+    if (op == "eq") return a == b;
+    if (op == "ne") return a != b;
+    if (op == "add") return wrap((ll)a + b);
+    if (op == "sub") return wrap((ll)a - b);
+    if (op == "mul") return wrap((ll)a * b);
+    if (op == "shl") return wrap((ll)((uint64_t)(ll)a << (b & 31)));
+    if (b == 0) { trap = true; return 0; }
+    ll q = llabs((ll)a) / llabs((ll)b);
+    if ((a < 0) != (b < 0)) q = -q;                       // C++ truncates toward zero
+    return op == "div" ? wrap(q) : wrap(a - q * b); }
+static Result run(const Prog& P, const VS& inputs, ll limit, bool asmMode = false) {
+    static const map<string, int> COST = {{"mul", 3}, {"div", 10}, {"mod", 10}, {"print", 5}, {"prints", 5}, {"read", 5},
+                                          {"call", 5}, {"ret", 2}, {"newarr", 5}, {"aload", 2}, {"astore", 2}, {"label", 0}};
+    static const Ins RET0 = [] { Ins i; i.op = "ret"; i.a = C(0); return i; }();
+    map<string, int> fi; vector<map<string, int>> labs(P.size());
+    for (size_t f = 0; f < P.size(); f++) {
+        fi[P[f].name] = f;
+        for (size_t k = 0; k < P[f].code.size(); k++) if (P[f].code[k].op == "label") labs[f][P[f].code[k].lab] = k;
+    }
+    struct Fr { int f; size_t pc; map<string, int> env; string dst; };
+    vector<vector<int>> heap(1);                          // arrays live here; a variable holds the array's handle
+    vector<Fr> stack; map<string, int> env; Result R; size_t nin = 0, pc = 0; int f = fi["main"];
+    auto val = [&](const O& o) { if (o.k) return o.v; auto it = env.find(o.s); return it == env.end() ? 0 : it->second; };
+    auto trap = [&](const string& m) { R.status = "trap"; R.msg = m; return R; };
+    auto spilled = [](const string& s) { return s.size() > 1 && s[0] == 'M' && all_of(s.begin() + 1, s.end(), ::isdigit); };
+    for (ll step = 0; step < limit; step++) {
+        const Code& code = P[f].code;
+        const Ins& ins = pc < code.size() ? code[pc] : RET0; pc++;
+        const string& op = ins.op;
+        auto c = COST.find(op); R.cost += c == COST.end() ? 1 : c->second;
+        if (asmMode) {   // reading/writing a spilled (M#) operand costs an extra memory cycle
+            R.cost += spilled(ins.d) + (ins.a.var() && spilled(ins.a.s)) + (ins.b.var() && spilled(ins.b.s)) + (ins.c.var() && spilled(ins.c.s));
+            for (const O& x : ins.args) R.cost += x.var() && spilled(x.s);
+        }
+        if (isBin(op)) { bool z = false; int r = calc(op, val(ins.a), val(ins.b), z); if (z) return trap("division by zero"); env[ins.d] = r; }
+        else if (op == "mov") env[ins.d] = val(ins.a);
+        else if (op == "neg") env[ins.d] = wrap(-(ll)val(ins.a));
+        else if (op == "not") env[ins.d] = val(ins.a) == 0;
+        else if (op == "jmp") pc = labs[f].at(ins.lab);
+        else if (op == "jz") { if (val(ins.a) == 0) pc = labs[f].at(ins.lab); }
+        else if (op == "jnz") { if (val(ins.a) != 0) pc = labs[f].at(ins.lab); }
+        else if (op == "print") R.out += to_string(val(ins.a));
+        else if (op == "prints") R.out += ins.text;
+        else if (op == "read") {
+            string tk = nin < inputs.size() ? inputs[nin++] : "0";
+            try { size_t p; ll v = stoll(tk, &p); if (p != tk.size()) throw 1; env[ins.d] = wrap(v); }
+            catch (...) { return trap("input '" + tk + "' is not a whole number"); }
+        } else if (op == "newarr") {
+            int n = val(ins.a);
+            if (n < 0 || n > 1000000) return trap("cannot create an array of size " + to_string(n));
+            heap.push_back(vector<int>(n, 0)); env[ins.d] = heap.size() - 1;
+        } else if (op == "aload" || op == "astore") {
+            int h = val(ins.a), idx = val(ins.b);
+            if (idx < 0 || idx >= (int)heap[h].size()) return trap("index " + to_string(idx) + " is outside the array (size " + to_string(heap[h].size()) + ")");
+            if (op == "aload") env[ins.d] = heap[h][idx]; else heap[h][idx] = val(ins.c);
+        } else if (op == "call") {
+            if (stack.size() >= 300) return trap("stack overflow (too many nested calls)");
+            vector<int> args; for (const O& x : ins.args) args.push_back(val(x));
+            int g = fi.at(ins.callee);
+            stack.push_back({f, pc, move(env), ins.d}); env.clear();
+            f = g; pc = 0; for (size_t k = 0; k < args.size(); k++) env[P[g].params[k]] = args[k];
+        } else if (op == "ret") {
+            int r = ins.a.none() ? 0 : val(ins.a);
+            if (stack.empty()) return R;
+            Fr fr = move(stack.back()); stack.pop_back();
+            f = fr.f; pc = fr.pc; env = move(fr.env); if (!fr.dst.empty()) env[fr.dst] = r;
+        }
+    }
+    R.status = "timeout"; return R; }
