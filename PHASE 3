@@ -1,1 +1,122 @@
-
+struct Sym { string name, type, uid, role, func; int line; bool used = false; };
+static bool isNum(const string& t) { return t == "int" || t == "bool"; }
+static bool fits(const string& w, const string& g) { return w == g || (isNum(w) && isNum(g)); }
+static bool alwaysReturns(Node* s) {
+    if (!s) return false;
+    if (s->kind == "return") return true;
+    if (s->kind == "block") { for (Node* x : s->list) if (alwaysReturns(x)) return true; return false; }
+    return s->kind == "if" && s->c && alwaysReturns(s->b) && alwaysReturns(s->c); }
+struct Sem {   // scoped symbol table + type checker; gives every variable a unique name (x, x.1, ...)
+    Node* prog; vector<pair<int, string>> errs; VS warns; vector<Sym*> syms;
+    map<string, pair<VS, string>> sigs; vector<map<string, Sym*>> scopes;
+    Node* fn = nullptr; int loops = 0; map<string, int> counts;
+    Sem(Node* p) : prog(p) {
+        for (Node* f : p->list) { VS ts; for (auto& pr : f->params) ts.push_back(pr.first); sigs[f->name] = {ts, f->type}; }
+    }
+    void err(int line, const string& m) { errs.push_back({line, "line " + to_string(line) + ": " + m}); }
+    Sym* declare(const string& name, const string& type, int line, const string& role) {
+        if (scopes.back().count(name)) err(line, "'" + name + "' is already declared in this scope");
+        int n = counts.count(name) ? counts[name] + 1 : 0; counts[name] = n;
+        Sym* s = new Sym{name, type, n == 0 ? name : name + "." + to_string(n), role, fn->name, line};
+        scopes.back()[name] = s; syms.push_back(s); return s;
+    }
+    Sym* find(const string& name, int line) {
+        for (auto it = scopes.rbegin(); it != scopes.rend(); ++it) if (it->count(name)) return it->at(name);
+        err(line, "'" + name + "' is used before it is declared"); return nullptr;
+    }
+    Sem& run() {
+        set<string> seen;
+        for (Node* f : prog->list) if (!seen.insert(f->name).second) err(f->line, "function '" + f->name + "' is already defined");
+        if (!sigs.count("main")) err(1, "the program has no main() function");
+        else if (sigs["main"] != make_pair(VS{}, string("int"))) err(1, "main must be written as int main()");
+        for (Node* f : prog->list) function(f);
+        if (!errs.empty()) {
+            sort(errs.begin(), errs.end()); errs.erase(unique(errs.begin(), errs.end()), errs.end());
+            VS m; for (auto& e : errs) m.push_back(e.second);
+            throw CompileError{m};
+        }
+        return *this;
+    }
+    void function(Node* f) {
+        fn = f; counts.clear(); scopes = {{}};
+        for (auto& p : f->params) f->puids.push_back(declare(p.second, p.first, f->line, "param")->uid);
+        st(f->a);
+        if (f->type != "void" && f->name != "main" && !alwaysReturns(f->a))
+            warns.push_back("line " + to_string(f->line) + ": function '" + f->name + "' may end without returning a " + f->type);
+        for (Sym* s : syms) if (s->func == f->name && s->role == "local" && !s->used)
+            warns.push_back("line " + to_string(s->line) + ": variable '" + s->name + "' is never used");
+    }
+    Sym* use(Node* e) { Sym* s = find(e->name, e->line); if (s) { s->used = true; e->uid = s->uid; } return s; }
+    string exIndex(Node* e) {
+        if (!isNum(ex(e->a))) err(e->line, "an array index must be an int");
+        Sym* s = use(e);
+        if (s && !isArr(s->type)) err(e->line, "'" + e->name + "' is not an array");
+        return "int";
+    }
+    string ex(Node* e) { return e->type = ex_(e); }
+    string ex_(Node* e) {
+        const string& k = e->kind;
+        if (k == "num") return "int";
+        if (k == "bool") return "bool";
+        if (k == "var") { Sym* s = use(e); return s ? s->type : "int"; }
+        if (k == "index") return exIndex(e);
+        if (k == "unary") {
+            string t = ex(e->a);
+            if (!isNum(t)) err(e->line, "'" + e->op + "' cannot be used on " + t);
+            return e->op == "!" ? "bool" : "int";
+        }
+        if (k == "bin") {
+            string l = ex(e->a), r = ex(e->b);
+            if (!isNum(l) || !isNum(r)) err(e->line, "'" + e->op + "' cannot be used on " + l + " and " + r);
+            return string("+-*/%").find(e->op) != string::npos ? "int" : "bool";
+        }
+        VS types; for (Node* a : e->list) types.push_back(ex(a));   // call
+        if (!sigs.count(e->name)) { err(e->line, "function '" + e->name + "' is not defined"); return "int"; }
+        auto& sg = sigs[e->name];
+        if (types.size() != sg.first.size()) err(e->line, "'" + e->name + "' needs " + to_string(sg.first.size()) + " argument(s), got " + to_string(types.size()));
+        else for (size_t n = 0; n < types.size(); n++)
+            if (!fits(sg.first[n], types[n])) err(e->line, "argument " + to_string(n + 1) + " of '" + e->name + "' must be " + sg.first[n] + ", not " + types[n]);
+        return sg.second;
+    }
+    void cond(Node* e) { if (!isNum(ex(e))) err(e->line, "a condition must be an int or bool"); }
+    string target(Node* t) {
+        if (t->kind == "index") { t->type = exIndex(t); return "int"; }
+        Sym* s = find(t->name, t->line); if (!s) return "int";
+        t->uid = s->uid; t->type = s->type;
+        if (isArr(s->type)) err(t->line, "cannot assign to the whole array '" + t->name + "'");
+        return s->type;
+    }
+    void st(Node* s) {
+        const string& k = s->kind;
+        if (k == "block") { scopes.push_back({}); for (Node* x : s->list) st(x); scopes.pop_back(); }
+        else if (k == "decl") {
+            if (isArr(s->type)) {
+                if (s->a && !isNum(ex(s->a))) err(s->line, "an array size must be an int");
+                for (Node* it : s->list) if (!isNum(ex(it))) err(s->line, "array items must be int or bool");
+            } else if (s->b && !fits(s->type, ex(s->b)))
+                err(s->line, "cannot start '" + s->name + "' (" + s->type + ") with a value of type " + s->b->type);
+            s->uid = declare(s->name, s->type, s->line, "local")->uid;
+        } else if (k == "assign") {
+            string want = target(s->a), got = ex(s->b);
+            if (!fits(want, got)) err(s->line, "cannot assign " + got + " to '" + s->a->name + "' (" + want + ")");
+        } else if (k == "exprstmt") ex(s->a);
+        else if (k == "print") { for (Node* it : s->list) if (it->kind != "str" && !isNum(ex(it))) err(s->line, "only int, bool and text can be printed"); }
+        else if (k == "read") { for (Node* t : s->list) target(t); }
+        else if (k == "if") { cond(s->a); st(s->b); if (s->c) st(s->c); }
+        else if (k == "while") { cond(s->a); loops++; st(s->b); loops--; }
+        else if (k == "for") {
+            scopes.push_back({});
+            if (s->a) st(s->a);
+            if (s->c) st(s->c);
+            if (s->b) cond(s->b);
+            loops++; st(s->d); loops--; scopes.pop_back();
+        } else if (k == "break" || k == "continue") { if (!loops) err(s->line, "'" + k + "' is only allowed inside a loop"); }
+        else if (k == "return") {
+            string want = fn->type;
+            if (!s->a) { if (want != "void") err(s->line, "this function must return a " + want); return; }
+            string got = ex(s->a);
+            if (want == "void") err(s->line, "a void function cannot return a value");
+            else if (!fits(want, got)) err(s->line, "cannot return " + got + " from a function returning " + want);
+        }
+    }
+};
