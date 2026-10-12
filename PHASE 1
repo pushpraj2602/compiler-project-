@@ -1,1 +1,45 @@
-
+struct Token { string kind, text; int num = 0, line = 1; };
+static const set<string> KEYWORDS = {"int", "bool", "void", "if", "else", "while", "for", "return", "break",
+                                     "continue", "true", "false", "cout", "cin", "endl"};
+static vector<Token> tokenize(const string& s) {
+    vector<Token> t; VS errs; size_t i = 0; int line = 1;
+    auto push = [&](const string& k, const string& x, int n = 0) { t.push_back({k, x, n, line}); };
+    auto err = [&](const string& m) { errs.push_back("line " + to_string(line) + ": " + m); };
+    static const VS two = {"<<", ">>", "<=", ">=", "==", "!=", "&&", "||", "++", "--", "+=", "-=", "*=", "/=", "%="};
+    while (i < s.size()) {
+        char c = s[i];
+        if (c == '\n') { line++; i++; }
+        else if (isspace((unsigned char)c)) i++;
+        else if (s.compare(i, 2, "//") == 0 || c == '#') { while (i < s.size() && s[i] != '\n') i++; }
+        else if (s.compare(i, 2, "/*") == 0) {
+            size_t e = s.find("*/", i + 2);
+            if (e == string::npos) { err("this comment is never closed"); break; }
+            line += count(s.begin() + i, s.begin() + e, '\n'); i = e + 2;
+        } else if (isalpha((unsigned char)c) || c == '_') {
+            size_t j = i; while (j < s.size() && (isalnum((unsigned char)s[j]) || s[j] == '_')) j++;
+            string w = s.substr(i, j - i); i = j;
+            if (w == "std" && s.compare(i, 2, "::") == 0) i += 2;                         // std:: is ignored
+            else if (w == "using") { size_t e = s.find(';', i); i = e == string::npos ? s.size() : e + 1; }
+            else push(KEYWORDS.count(w) ? w : "id", w);
+        } else if (isdigit((unsigned char)c)) {
+            ll v = 0; size_t j = i;
+            while (j < s.size() && isdigit((unsigned char)s[j])) v = (v * 10 + (s[j++] - '0')) % (1LL << 32);
+            push("num", s.substr(i, j - i), wrap(v)); i = j;
+        } else if (c == '"') {
+            size_t j = i + 1; string v; bool ok = false;
+            while (j < s.size() && s[j] != '\n') {
+                if (s[j] == '"') { ok = true; break; }
+                if (s[j] == '\\' && j + 1 < s.size()) { char e = s[j + 1]; v += e == 'n' ? '\n' : e == 't' ? '\t' : e == '0' ? '\0' : e; j += 2; }
+                else v += s[j++];
+            }
+            if (ok) { push("str", v); i = j + 1; } else { err("this string is never closed"); i = j; }
+        } else {
+            string o2 = s.substr(i, 2);
+            if (find(two.begin(), two.end(), o2) != two.end()) { push(o2, o2); i += 2; }
+            else if (c && strchr("-+*/%<>=!(){}[];,", c)) { push(string(1, c), string(1, c)); i++; }
+            else { err("illegal character '" + string(1, c) + "'"); i++; }
+        }
+    }
+    t.push_back({"eof", "", 0, line});
+    if (!errs.empty()) throw CompileError{errs};
+    return t; }
